@@ -23,6 +23,7 @@ public class RoomController {
     @PostMapping
     public ResponseEntity<CreateRoomResponse> createRoom(){
         return ResponseEntity.status(HttpStatus.CREATED).body(roomService.createRoom());
+
     }
 
     @GetMapping("/{code}")

@@ -43,7 +43,7 @@ public class RoomService {
                 Room(null,
                 code,
                 now,
-               now.plusHours(24),
+               now.plusHours(24),  // Room expires after 24 hours
                 new ArrayList<>());
 
         roomRepository.save(room);
