@@ -7,7 +7,10 @@ import com.ashutosh.fylex.model.FileMetaData;
 import com.ashutosh.fylex.model.Room;
 import com.ashutosh.fylex.repo.FileMetaDataRepository;
 import com.ashutosh.fylex.repo.RoomRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.UrlResource;
 import org.springframework.http.HttpHeaders;
@@ -20,13 +23,17 @@ import java.net.MalformedURLException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.security.SecureRandom;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 
 @Service
 public class RoomService {
+
+    private static final Logger logger = LoggerFactory.getLogger(RoomService.class);
 
     @Autowired
     RoomRepository roomRepository;
@@ -34,29 +41,36 @@ public class RoomService {
     @Autowired
     FileMetaDataRepository fileMetaDataRepository;
 
-    public CreateRoomResponse createRoom() {
+    @Value("${app.upload.dir:./uploads}")
+    private String uploadDir;
 
+    @Value("${app.max-file-size:52428800}")
+    private long maxFileSize;
+
+    @Value("${app.allowed-extensions:pdf,docx,xlsx,jpg,png,txt}")
+    private String allowedExtensions;
+
+    public CreateRoomResponse createRoom() {
         String code = generateCode();
         LocalDateTime now = LocalDateTime.now();
 
-        Room room = new
-                Room(null,
-                code,
-                now,
-               now.plusHours(24),  // Room expires after 24 hours
-                new ArrayList<>());
-
+        Room room = new Room(null, code, now, now.plusHours(24), new ArrayList<>());
         roomRepository.save(room);
-        return new CreateRoomResponse(room.getRoomCode(),room.getCreatedAt(),room.getExpiresAt());
-
+        
+        logger.info("Room created successfully with code: {}, expires at: {}", code, now.plusHours(24));
+        return new CreateRoomResponse(room.getRoomCode(), room.getCreatedAt(), room.getExpiresAt());
     }
-    public RoomDetailsResponse getRoomByCode(String code){
+    public RoomDetailsResponse getRoomByCode(String code) {
+        logger.debug("Fetching room details for code: {}", code);
+        
         Room room = roomRepository.findByRoomCode(code)
-                .orElseThrow(()-> new RuntimeException("Room not found with code :"+code));
-
+                .orElseThrow(() -> {
+                    logger.warn("Room not found with code: {}", code);
+                    return new RoomNotFoundException("Room not found with code: " + code);
+                });
 
         List<FileRespone> files = room.getFiles().stream()
-                .map(file->new FileRespone(
+                .map(file -> new FileRespone(
                         file.getId(),
                         file.getOriginalFileName(),
                         file.getSize(),
@@ -72,22 +86,44 @@ public class RoomService {
     }
 
 
-    private String generateCode(){
-        return UUID.randomUUID().toString().substring(0,6).toUpperCase();
+    private String generateCode() {
+        // Use SecureRandom for cryptographically secure randomness
+        SecureRandom random = new SecureRandom();
+        
+        // Character set: uppercase, lowercase, and digits for better entropy
+        String characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        
+        // Generate 10-character code (provides ~47 bits of entropy)
+        // vs 6-character UUID substring (provides ~24 bits)
+        StringBuilder code = new StringBuilder();
+        for (int i = 0; i < 10; i++) {
+            code.append(characters.charAt(random.nextInt(characters.length())));
+        }
+        
+        return code.toString();
     }
 
     public FileUploadResponse uploadFile(String code, MultipartFile file) {
+        logger.debug("Starting file upload for room code: {}, filename: {}", code, file.getOriginalFilename());
+        
+        // Validate file
+        validateFile(file);
+
         Room room = roomRepository.findByRoomCode(code)
-                .orElseThrow(() -> new RoomNotFoundException("Room not found with code: " + code));
+                .orElseThrow(() -> {
+                    logger.warn("Room not found with code: {} during file upload", code);
+                    return new RoomNotFoundException("Room not found with code: " + code);
+                });
 
         try {
-            String uploadDir = System.getProperty("user.dir") + "/uploads";
-            Files.createDirectories(Paths.get(uploadDir));
+            Path uploadPath = Paths.get(uploadDir);
+            Files.createDirectories(uploadPath);
 
             String storedFileName = UUID.randomUUID() + "_" + file.getOriginalFilename();
-            Path filePath = Paths.get(uploadDir, storedFileName);
+            Path filePath = uploadPath.resolve(storedFileName);
 
             file.transferTo(filePath.toFile());
+            logger.info("File saved successfully: {} with stored name: {}", file.getOriginalFilename(), storedFileName);
 
             FileMetaData fileMetaData = new FileMetaData();
             fileMetaData.setOriginalFileName(file.getOriginalFilename());
@@ -97,6 +133,7 @@ public class RoomService {
             fileMetaData.setRoom(room);
 
             FileMetaData savedFile = fileMetaDataRepository.save(fileMetaData);
+            logger.info("File metadata saved with ID: {}", savedFile.getId());
 
             return new FileUploadResponse(
                     savedFile.getId(),
@@ -106,55 +143,109 @@ public class RoomService {
             );
 
         } catch (IOException e) {
-            throw new RuntimeException("Failed to store file");
+            logger.error("Failed to store file: {}", file.getOriginalFilename(), e);
+            throw new RuntimeException("Failed to store file: " + e.getMessage());
+        }
+    }
+
+    private void validateFile(MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            logger.warn("Attempted to upload empty file");
+            throw new IllegalArgumentException("File cannot be empty");
+        }
+
+        // Validate file size
+        if (file.getSize() > maxFileSize) {
+            logger.warn("File size exceeds limit: {} bytes (max: {})", file.getSize(), maxFileSize);
+            throw new IllegalArgumentException(
+                    "File size exceeds maximum limit of " + (maxFileSize / (1024 * 1024)) + " MB"
+            );
+        }
+
+        // Validate file extension
+        String originalFilename = file.getOriginalFilename();
+        if (originalFilename == null || !originalFilename.contains(".")) {
+            logger.warn("Invalid filename: {}", originalFilename);
+            throw new IllegalArgumentException("Invalid filename");
+        }
+
+        String fileExtension = originalFilename.substring(originalFilename.lastIndexOf(".") + 1).toLowerCase();
+        List<String> allowedExtList = Arrays.asList(allowedExtensions.split(","));
+
+        if (!allowedExtList.contains(fileExtension)) {
+            logger.warn("File type not allowed: {} (allowed types: {})", fileExtension, allowedExtensions);
+            throw new IllegalArgumentException(
+                    "File type ." + fileExtension + " is not allowed. Allowed types: " + allowedExtensions
+            );
         }
     }
 
     public ResponseEntity<Resource> downloadFile(String code, Long fileId) {
+        logger.debug("Downloading file ID: {} from room: {}", fileId, code);
+        
         Room room = roomRepository.findByRoomCode(code)
-                .orElseThrow(()-> new RoomNotFoundException("Room not found with code: "+code));
+                .orElseThrow(() -> {
+                    logger.warn("Room not found with code: {} during download", code);
+                    return new RoomNotFoundException("Room not found with code: " + code);
+                });
 
-        FileMetaData fileMetaData = fileMetaDataRepository.findByIdAndRoom(fileId,room)
-                .orElseThrow(()-> new FileNotFoundException("File not found with id: "+fileId));
+        FileMetaData fileMetaData = fileMetaDataRepository.findByIdAndRoom(fileId, room)
+                .orElseThrow(() -> {
+                    logger.warn("File not found with ID: {} in room: {}", fileId, code);
+                    return new FileNotFoundException("File not found with id: " + fileId);
+                });
 
-        String uploadDir = Paths.get(System.getProperty("user.dir"), "uploads").toString();
         Path filePath = Paths.get(uploadDir, fileMetaData.getStoredFileName());
 
         try {
             Resource resource = new UrlResource(filePath.toUri());
 
             if (!resource.exists()) {
-                throw new RuntimeException("File not found on disk");
+                logger.error("File not found on disk: {}", filePath);
+                throw new FileNotFoundException("File not found on disk");
             }
 
+            logger.info("File downloaded successfully: {}", fileMetaData.getOriginalFileName());
+            
             return ResponseEntity.ok()
                     .header(HttpHeaders.CONTENT_DISPOSITION,
                             "attachment; filename=\"" + fileMetaData.getOriginalFileName() + "\"")
                     .body(resource);
 
         } catch (MalformedURLException e) {
-            throw new RuntimeException("Failed to download file");
+            logger.error("Failed to create URL resource for file: {}", filePath, e);
+            throw new RuntimeException("Failed to download file: " + e.getMessage());
         }
     }
 
     public DeleteFileResponse deleteFile(String code, Long fileId) {
-
+        logger.debug("Deleting file ID: {} from room: {}", fileId, code);
+        
         Room room = roomRepository.findByRoomCode(code)
-                .orElseThrow(()->new RoomNotFoundException("Room not found with code: "+code));
+                .orElseThrow(() -> {
+                    logger.warn("Room not found with code: {} during deletion", code);
+                    return new RoomNotFoundException("Room not found with code: " + code);
+                });
 
-        FileMetaData fileMetaData = fileMetaDataRepository.findByIdAndRoom(fileId,room)
-                .orElseThrow(()->new FileNotFoundException("File not found with id: "+fileId));
+        FileMetaData fileMetaData = fileMetaDataRepository.findByIdAndRoom(fileId, room)
+                .orElseThrow(() -> {
+                    logger.warn("File not found with ID: {} in room: {}", fileId, code);
+                    return new FileNotFoundException("File not found with id: " + fileId);
+                });
 
-        String uploadDir = Paths.get(System.getProperty("user.dir"), "uploads").toString();
         Path filePath = Paths.get(uploadDir, fileMetaData.getStoredFileName());
 
         try {
             Files.deleteIfExists(filePath);
+            logger.info("File deleted from disk: {}", fileMetaData.getStoredFileName());
         } catch (IOException e) {
+            logger.error("Failed to delete file from disk: {}", filePath, e);
             throw new RuntimeException("Failed to delete file from disk: " + e.getMessage());
         }
 
         fileMetaDataRepository.delete(fileMetaData);
+        logger.info("File record deleted from database: {}", fileMetaData.getOriginalFileName());
+        
         return new DeleteFileResponse("File Deleted Successfully!");
 
     }
