@@ -3,6 +3,7 @@ package com.ashutosh.fylex.controller;
 
 import com.ashutosh.fylex.dto.CreateRoomResponse;
 import com.ashutosh.fylex.dto.DeleteFileResponse;
+import com.ashutosh.fylex.dto.FileListResponse;
 import com.ashutosh.fylex.dto.FileUploadResponse;
 import com.ashutosh.fylex.dto.RoomDetailsResponse;
 import com.ashutosh.fylex.service.RoomService;
@@ -56,4 +57,10 @@ public class RoomController {
         return ResponseEntity.ok(roomService.deleteFile(code,fileId));
     }
 
+    @GetMapping("/{code}/files")
+    public ResponseEntity<FileListResponse> getAllFiles(
+            @PathVariable String code
+    ){
+        return ResponseEntity.ok(roomService.getAllFiles(code));
+    }
 }

@@ -2,6 +2,7 @@ package com.ashutosh.fylex.service;
 
 import com.ashutosh.fylex.dto.*;
 import com.ashutosh.fylex.exception.FileNotFoundException;
+import com.ashutosh.fylex.exception.FileStorageException;
 import com.ashutosh.fylex.exception.RoomNotFoundException;
 import com.ashutosh.fylex.model.FileMetaData;
 import com.ashutosh.fylex.model.Room;
@@ -9,7 +10,6 @@ import com.ashutosh.fylex.repo.FileMetaDataRepository;
 import com.ashutosh.fylex.repo.RoomRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.UrlResource;
@@ -26,7 +26,6 @@ import java.nio.file.Paths;
 import java.security.SecureRandom;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 
@@ -35,20 +34,18 @@ public class RoomService {
 
     private static final Logger logger = LoggerFactory.getLogger(RoomService.class);
 
-    @Autowired
-    RoomRepository roomRepository;
+    private final RoomRepository roomRepository;
+    private final FileMetaDataRepository fileMetaDataRepository;
+    private final FileValidator fileValidator;
 
-    @Autowired
-    FileMetaDataRepository fileMetaDataRepository;
+    private final Path uploadPath;
 
-    @Value("${app.upload.dir:./uploads}")
-    private String uploadDir;
-
-    @Value("${app.max-file-size:52428800}")
-    private long maxFileSize;
-
-    @Value("${app.allowed-extensions:pdf,docx,xlsx,jpg,png,txt}")
-    private String allowedExtensions;
+    public RoomService(RoomRepository roomRepository, FileMetaDataRepository fileMetaDataRepository, FileValidator fileValidator, @Value("${app.upload.dir:./uploads}") String uploadDir) {
+        this.roomRepository = roomRepository;
+        this.fileMetaDataRepository = fileMetaDataRepository;
+        this.fileValidator = fileValidator;
+        this.uploadPath = Paths.get(uploadDir).toAbsolutePath().normalize();
+    }
 
     public CreateRoomResponse createRoom() {
         String code = generateCode();
@@ -106,8 +103,7 @@ public class RoomService {
     public FileUploadResponse uploadFile(String code, MultipartFile file) {
         logger.debug("Starting file upload for room code: {}, filename: {}", code, file.getOriginalFilename());
         
-        // Validate file
-        validateFile(file);
+        fileValidator.validateFile(file);
 
         Room room = roomRepository.findByRoomCode(code)
                 .orElseThrow(() -> {
@@ -116,7 +112,6 @@ public class RoomService {
                 });
 
         try {
-            Path uploadPath = Paths.get(uploadDir);
             Files.createDirectories(uploadPath);
 
             String storedFileName = UUID.randomUUID() + "_" + file.getOriginalFilename();
@@ -144,39 +139,7 @@ public class RoomService {
 
         } catch (IOException e) {
             logger.error("Failed to store file: {}", file.getOriginalFilename(), e);
-            throw new RuntimeException("Failed to store file: " + e.getMessage());
-        }
-    }
-
-    private void validateFile(MultipartFile file) {
-        if (file == null || file.isEmpty()) {
-            logger.warn("Attempted to upload empty file");
-            throw new IllegalArgumentException("File cannot be empty");
-        }
-
-        // Validate file size
-        if (file.getSize() > maxFileSize) {
-            logger.warn("File size exceeds limit: {} bytes (max: {})", file.getSize(), maxFileSize);
-            throw new IllegalArgumentException(
-                    "File size exceeds maximum limit of " + (maxFileSize / (1024 * 1024)) + " MB"
-            );
-        }
-
-        // Validate file extension
-        String originalFilename = file.getOriginalFilename();
-        if (originalFilename == null || !originalFilename.contains(".")) {
-            logger.warn("Invalid filename: {}", originalFilename);
-            throw new IllegalArgumentException("Invalid filename");
-        }
-
-        String fileExtension = originalFilename.substring(originalFilename.lastIndexOf(".") + 1).toLowerCase();
-        List<String> allowedExtList = Arrays.asList(allowedExtensions.split(","));
-
-        if (!allowedExtList.contains(fileExtension)) {
-            logger.warn("File type not allowed: {} (allowed types: {})", fileExtension, allowedExtensions);
-            throw new IllegalArgumentException(
-                    "File type ." + fileExtension + " is not allowed. Allowed types: " + allowedExtensions
-            );
+            throw new FileStorageException("Failed to store file: " + e.getMessage(), e);
         }
     }
 
@@ -195,7 +158,7 @@ public class RoomService {
                     return new FileNotFoundException("File not found with id: " + fileId);
                 });
 
-        Path filePath = Paths.get(uploadDir, fileMetaData.getStoredFileName());
+        Path filePath = uploadPath.resolve(fileMetaData.getStoredFileName());
 
         try {
             Resource resource = new UrlResource(filePath.toUri());
@@ -214,7 +177,7 @@ public class RoomService {
 
         } catch (MalformedURLException e) {
             logger.error("Failed to create URL resource for file: {}", filePath, e);
-            throw new RuntimeException("Failed to download file: " + e.getMessage());
+            throw new FileStorageException("Failed to download file: " + e.getMessage(), e);
         }
     }
 
@@ -233,20 +196,39 @@ public class RoomService {
                     return new FileNotFoundException("File not found with id: " + fileId);
                 });
 
-        Path filePath = Paths.get(uploadDir, fileMetaData.getStoredFileName());
+        Path filePath = uploadPath.resolve(fileMetaData.getStoredFileName());
 
         try {
             Files.deleteIfExists(filePath);
             logger.info("File deleted from disk: {}", fileMetaData.getStoredFileName());
         } catch (IOException e) {
             logger.error("Failed to delete file from disk: {}", filePath, e);
-            throw new RuntimeException("Failed to delete file from disk: " + e.getMessage());
+            throw new FileStorageException("Failed to delete file from disk: " + e.getMessage(), e);
         }
 
         fileMetaDataRepository.delete(fileMetaData);
         logger.info("File record deleted from database: {}", fileMetaData.getOriginalFileName());
-        
+
         return new DeleteFileResponse("File Deleted Successfully!");
 
+    }
+
+    public FileListResponse getAllFiles(String code) {
+        logger.debug("Fetching all files for room code: {}", code);
+        Room room = roomRepository.findByRoomCode(code)
+                .orElseThrow(() -> {
+                    logger.warn("Room not found with code: {}", code);
+                    return new RoomNotFoundException("Room not found with code: " + code);
+                });
+
+        List<FileRespone> files = room.getFiles().stream()
+                .map(file -> new FileRespone(
+                        file.getId(),
+                        file.getOriginalFileName(),
+                        file.getSize(),
+                        file.getUploadTime()
+                )).toList();
+
+        return new FileListResponse(files);
     }
 }
